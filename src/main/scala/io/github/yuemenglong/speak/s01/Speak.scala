@@ -29,7 +29,18 @@ class SpeakContext(conf: SpeakConf) {
   }
 
   def run(tasks: Array[Task]): Unit = {
-    tasks.zip(executors).foreach { case (t, e) => e.execute(t) } // TODO taskPool
+    val counter = new AtomicLong()
+    tasks.zip(executors).foreach { case (t, e) =>
+      e.execute(new Task {
+        override def execute(): Unit = {
+          t.execute()
+          if (counter.incrementAndGet() == tasks.length) {
+            counter.synchronized(counter.notify())
+          }
+        }
+      })
+    } // TODO taskPool
+    counter.synchronized(counter.wait())
   }
 }
 
@@ -39,20 +50,12 @@ trait RDD[T] {
   def map[R](fn: T => R): RDD[R] = new Mapped(this, fn)
 
   def foreach(fn: T => Unit): Unit = {
-    val counter = new AtomicLong()
     val tasks = (0 until getPartition).map(i => new Task {
       override def execute(): Unit = {
         getData(i).foreach(fn)
       }
-
-      override def finish(): Unit = {
-        if (counter.incrementAndGet() == getPartition) {
-          counter.synchronized(counter.notify())
-        }
-      }
     }).toArray
     sc.run(tasks)
-    counter.synchronized(counter.wait())
   }
 
   def getPartition: Int
@@ -80,8 +83,6 @@ class Mapped[U, T](parent: RDD[U], fn: U => T) extends RDD[T] {
 
 trait Task {
   def execute()
-
-  def finish()
 }
 
 class Executor extends Thread {
@@ -98,7 +99,6 @@ class Executor extends Thread {
         Thread.sleep(1)
       } else {
         task.execute()
-        task.finish()
       }
     }
   }

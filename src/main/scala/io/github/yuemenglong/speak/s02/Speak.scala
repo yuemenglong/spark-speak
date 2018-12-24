@@ -26,10 +26,9 @@ case class Register(id: Int, host: String, port: Int)
 
 case class Execute(task: Task)
 
-case class Finish(split: Int)
+case class Finish()
 
 class SpeakContext(conf: SpeakConf) extends Serializable {
-  @transient val counter: AtomicLong = new AtomicLong()
   @transient val executors: Array[ExecutorProxy] = (0 until conf.executorNum).map(_ => new ExecutorProxy).toArray
   @transient val rpc = new Rpc(6666, {
     case Register(id, host, port) =>
@@ -37,15 +36,10 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
       executors(id).port = port
       println(id, host, port)
       OK()
-    case Finish(split) =>
-      if (counter.decrementAndGet() == 0) {
-        counter.synchronized(counter.notify())
-      }
-      OK()
   })
   rpc.start()
   // TODO run on yarn
-  (0 until conf.executorNum).map(i => new ExecutorStub(i, "localhost", 6666, 6667 + i))
+  (0 until conf.executorNum).map(i => new ExecutorService(i, "localhost", 6666, 6667 + i))
   //  executors.foreach(_.start())
 
   def paralellize[T](seq: Seq[T], partition: Int): RDD[T] = {
@@ -53,16 +47,30 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
   }
 
   def run(tasks: Array[Task]): Unit = {
-    counter.set(tasks.length)
-    tasks.zip(executors).foreach { case (t, e) => e.execute(t) } // TODO taskPool
+    val counter = new AtomicLong(tasks.length)
+    val jobRpc = new Rpc(9999, {
+      case Finish() =>
+        if (counter.decrementAndGet() == 0) {
+          counter.synchronized(counter.notify())
+        }
+        OK()
+    }).start()
+    tasks.zip(executors).foreach { case (t, e) =>
+      e.execute(new Task {
+        val task: Task = t
+
+        override def execute(): Unit = {
+          task.execute()
+          Rpc.call("localhost", 9999, Finish())
+        }
+      })
+    } // TODO taskPool
+    counter.synchronized(counter.wait())
+    jobRpc.stop()
   }
 
   def sendMaster(req: Object): Object = {
     Rpc.call("localhost", 6666, req)
-  }
-
-  def waiting(): Unit = {
-    counter.synchronized(counter.wait())
   }
 }
 
@@ -76,13 +84,8 @@ trait RDD[T] extends Serializable {
       override def execute(): Unit = {
         getData(i).foreach(fn)
       }
-
-      override def finish(): Unit = {
-        sc.sendMaster(Finish(i))
-      }
     }).toArray
     sc.run(tasks)
-    sc.waiting()
   }
 
   def getPartition: Int
@@ -93,9 +96,11 @@ trait RDD[T] extends Serializable {
 class ParalellizeRDD[T](val sc: SpeakContext, seq: Seq[T], part: Int) extends RDD[T] {
   override def getPartition: Int = part
 
+  def splitSize: Int = Math.ceil(seq.length * 1.0 / getPartition).toInt
+
   override def getData(split: Int): Stream[T] = {
-    val start = seq.length / getPartition * split
-    val end = seq.length / getPartition * (split + 1)
+    val start = splitSize * split
+    val end = Math.min(splitSize * (split + 1), seq.length)
     (start until end).toStream.map(seq(_))
   }
 }
@@ -110,8 +115,6 @@ class MappedRDD[U, T](parent: RDD[U], fn: U => T) extends RDD[T] {
 
 trait Task extends Serializable {
   def execute()
-
-  def finish()
 }
 
 class ExecutorProxy {
@@ -127,7 +130,7 @@ class ExecutorProxy {
   }
 }
 
-class ExecutorStub(id: Int, mhost: String, mport: Int, port: Int) {
+class ExecutorService(id: Int, mhost: String, mport: Int, port: Int) {
   val executor = new Executor
   executor.start()
   val rpc = new Rpc(port, {
@@ -157,7 +160,6 @@ class Executor extends Thread {
         Thread.sleep(1)
       } else {
         task.execute()
-        task.finish()
       }
     }
   }
