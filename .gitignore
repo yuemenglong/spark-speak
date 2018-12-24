@@ -1,4 +1,3 @@
 .idea/
-speak.iml
 target/
-
+*.iml
