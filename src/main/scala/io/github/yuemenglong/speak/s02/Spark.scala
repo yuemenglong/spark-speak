@@ -1,4 +1,4 @@
-package io.github.yuemenglong.speak
+package io.github.yuemenglong.speak.s02
 
 import org.apache.spark.{SparkConf, SparkContext}
 

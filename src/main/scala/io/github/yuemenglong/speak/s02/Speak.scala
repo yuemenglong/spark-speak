@@ -1,6 +1,5 @@
-package io.github.yuemenglong.speak
+package io.github.yuemenglong.speak.s02
 
-import java.beans.Transient
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicLong
 
@@ -59,7 +58,7 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
   }
 
   def sendMaster(req: Object): Object = {
-    Rpc.send(req, "localhost", 6666)
+    Rpc.call("localhost", 6666, req)
   }
 
   def waiting(): Unit = {
@@ -73,7 +72,7 @@ trait RDD[T] extends Serializable {
   def map[R](fn: T => R): RDD[R] = new MappedRDD(this, fn)
 
   def foreach(fn: T => Unit): Unit = {
-    val tasks = (0 until partition).map(i => new Task {
+    val tasks = (0 until getPartition).map(i => new Task {
       override def execute(): Unit = {
         getData(i).foreach(fn)
       }
@@ -86,23 +85,23 @@ trait RDD[T] extends Serializable {
     sc.waiting()
   }
 
-  def partition: Int
+  def getPartition: Int
 
   def getData(split: Int): Stream[T]
 }
 
 class ParalellizeRDD[T](val sc: SpeakContext, seq: Seq[T], part: Int) extends RDD[T] {
-  override def partition: Int = part
+  override def getPartition: Int = part
 
   override def getData(split: Int): Stream[T] = {
-    val start = seq.length / partition * split
-    val end = seq.length / partition * (split + 1)
+    val start = seq.length / getPartition * split
+    val end = seq.length / getPartition * (split + 1)
     (start until end).toStream.map(seq(_))
   }
 }
 
 class MappedRDD[U, T](parent: RDD[U], fn: U => T) extends RDD[T] {
-  override def partition: Int = parent.partition
+  override def getPartition: Int = parent.getPartition
 
   override def getData(split: Int): Stream[T] = parent.getData(split).map(fn)
 
@@ -120,7 +119,7 @@ class ExecutorProxy {
   var port = 0
 
   def send(req: Object): Object = {
-    Rpc.send(req, host, port)
+    Rpc.call(host, port, req)
   }
 
   def execute(task: Task): Unit = {
@@ -140,7 +139,7 @@ class ExecutorStub(id: Int, mhost: String, mport: Int, port: Int) {
   sendMaster(Register(id, "localhost", port))
 
   def sendMaster(req: Object): Object = {
-    Rpc.send(req, mhost, mport)
+    Rpc.call(mhost, mport, req)
   }
 }
 
