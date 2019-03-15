@@ -1,6 +1,6 @@
 package io.github.yuemenglong.speak.s00
 
-import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.{BlockingDeque, ConcurrentLinkedDeque, LinkedBlockingDeque, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -21,8 +21,9 @@ class SpeakConf() {
 }
 
 class SpeakContext(conf: SpeakConf) extends Serializable {
-  @transient val executors: Array[ExecutorProxy] = (0 until conf.executorNum)
-    .map(i => new ExecutorProxy("localhost", 6000 + i)).toArray
+  @transient val executors: BlockingDeque[ExecutorProxy] = new LinkedBlockingDeque[ExecutorProxy]()
+  (0 until conf.executorNum).map(i => new ExecutorProxy("localhost", 6000 + i)).toArray
+    .foreach(executors.put)
 
   // yarn start java -cp xx.jar com.xx.ExecutorService i+6000
   (0 until conf.executorNum).foreach(i => new ExecutorService(i + 6000))
@@ -35,7 +36,8 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
   def run(tasks: Array[Task]): Unit = {
     val counter = new AtomicLong()
     val rpc = new Rpc(9999, {
-      case "Finish" => {
+      case ("Finish", e: ExecutorProxy) => {
+        executors.put(e)
         if (counter.incrementAndGet() == tasks.length) {
           counter.synchronized(counter.notify())
         }
@@ -43,17 +45,15 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
       }
     })
     rpc.start()
-    tasks.zip(executors).foreach { case (t, e) =>
+    tasks.foreach(t => {
+      val e = executors.poll(100000, TimeUnit.SECONDS)
       e.execute(new Task {
         override def execute(): Unit = {
           t.execute()
-          Rpc.call("localhost", 9999, "Finish")
-          //          if (counter.incrementAndGet() == tasks.length) {
-          //            counter.synchronized(counter.notify())
-          //          }
+          Rpc.call("localhost", 9999, ("Finish", e))
         }
       })
-    } // TODO taskPool
+    })
     counter.synchronized(counter.wait())
     rpc.stop()
   }
@@ -82,9 +82,9 @@ class ParalellizeRDD[T](val sc: SpeakContext, seq: Seq[T], part: Int) extends RD
   override def getPartition: Int = part
 
   override def getData(split: Int): Stream[T] = {
-    val start = seq.length / getPartition * split
-    val end = seq.length / getPartition * (split + 1)
-    (start until end).toStream.map(seq(_))
+    val size = Math.ceil(seq.length * 1.0 / part).toInt
+    val arr = seq.grouped(size).drop(split)
+    arr.next().toStream
   }
 }
 
@@ -100,23 +100,21 @@ trait Task extends Serializable {
   def execute()
 }
 
-class ExecutorProxy(host: String, port: Int) {
+class ExecutorProxy(host: String, port: Int) extends Serializable {
   def execute(task: Task): Unit = {
     Rpc.call(host, port, ("Execute", task))
   }
 }
 
 class ExecutorService(port: Int) {
-  val rpc = new Rpc(port, {
-    case ("Execute", t) => {
-      val task = t.asInstanceOf[Task]
-      executor.execute(task)
-      ""
-    }
-  })
-  rpc.start()
   val executor = new Executor
   executor.start()
+  val rpc = new Rpc(port, {
+    case ("Execute", t: Task) =>
+      executor.execute(t)
+      ""
+  })
+  rpc.start()
 }
 
 class Executor extends Thread {
@@ -142,7 +140,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val conf = new SpeakConf().setMaster("local[2]").setAppName("Speak")
     val sc = new SpeakContext(conf)
-    sc.paralellize(1 to 10, 2).map(_ * 2).foreach(println)
+    sc.paralellize(1 to 10, 3).map(_ * 2).foreach(println)
     println("Finish")
     System.exit(0) // TODO stop
   }

@@ -21,10 +21,11 @@ class SpeakConf() {
 }
 
 class SpeakContext(conf: SpeakConf) extends Serializable {
-  @transient val executors: Array[ExecutorProxy] = (0 until conf.executorNum).map(i => new ExecutorProxy("localhost", 6000 + i)).toArray
-  // java -cp xx.jar com.xx.ExecutorService i+6000
+  @transient val executors: Array[ExecutorProxy] = (0 until conf.executorNum)
+    .map(i => new ExecutorProxy("localhost", 6000 + i)).toArray
+
+  // yarn start java -cp xx.jar com.xx.ExecutorService i+6000
   (0 until conf.executorNum).foreach(i => new ExecutorService(i + 6000))
-  // wait executor setup
   //  executors.foreach(_.start())
 
   def paralellize[T](seq: Seq[T], partition: Int): RDD[T] = {
@@ -34,11 +35,12 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
   def run(tasks: Array[Task]): Unit = {
     val counter = new AtomicLong()
     val rpc = new Rpc(9999, {
-      case "Finish" =>
+      case "Finish" => {
         if (counter.incrementAndGet() == tasks.length) {
           counter.synchronized(counter.notify())
         }
-        "OK"
+        ""
+      }
     })
     rpc.start()
     tasks.zip(executors).foreach { case (t, e) =>
@@ -99,22 +101,22 @@ trait Task extends Serializable {
 }
 
 class ExecutorProxy(host: String, port: Int) {
-
   def execute(task: Task): Unit = {
     Rpc.call(host, port, ("Execute", task))
   }
 }
 
 class ExecutorService(port: Int) {
-  val rpc = new Rpc(port, {
-    case ("Execute", t) =>
-      val task = t.asInstanceOf[Task]
-      executor.execute(task)
-      "OK"
-  })
-  rpc.start()
   val executor = new Executor
   executor.start()
+  val rpc = new Rpc(port, {
+    case ("Execute", t) => t match {
+      case task: Task =>
+        executor.execute(task)
+        ""
+    }
+  })
+  rpc.start()
 }
 
 class Executor extends Thread {
