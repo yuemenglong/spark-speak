@@ -3,6 +3,8 @@ package io.github.yuemenglong.speak.s00
 import java.util.concurrent.{BlockingDeque, ConcurrentLinkedDeque, LinkedBlockingDeque, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.collection.mutable.ArrayBuffer
+
 /**
   * Created by <yuemenglong@126.com> on 2018/12/15.
   */
@@ -29,7 +31,7 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
   (0 until conf.executorNum).foreach(i => new ExecutorService(i + 6000))
   //  executors.foreach(_.start())
 
-  def paralellize[T](seq: Seq[T], partition: Int): RDD[T] = {
+  def parallelize[T](seq: Seq[T], partition: Int): RDD[T] = {
     new ParalellizeRDD[T](this, seq, partition)
   }
 
@@ -56,6 +58,60 @@ class SpeakContext(conf: SpeakConf) extends Serializable {
     })
     counter.synchronized(counter.wait())
     rpc.stop()
+  }
+}
+
+object RDD {
+  implicit def toPair[K, V](rdd: RDD[(K, V)]): PairRDD[K, V] = new PairRDD(rdd)
+}
+
+class PairRDD[K, V](rdd: RDD[(K, V)]) extends RDD[(K, V)] {
+  override val sc: SpeakContext = rdd.sc
+
+  override def getPartition: Int = rdd.getPartition
+
+  override def getData(split: Int): Stream[(K, V)] = rdd.getData(split)
+
+  def reduceByKey(fn: (V, V) => V): RDD[(K, V)] = {
+    // 1. 相同k的聚合在一起
+    val res = new ArrayBuffer[Array[(K, Seq[V])]]
+    val rpc = new Rpc(8888, {
+      case ("Result", item: Array[(K, Seq[V])]) =>
+        res += item
+        ""
+    })
+    rpc.start()
+    val tasks = (0 until getPartition).map(split => {
+      new Task {
+        override def execute(): Unit = {
+          val res = rdd.getData(split).groupBy(_._1).mapValues(_.map(_._2)).toArray
+          Rpc.call("localhost", 8888, ("Result", res))
+        }
+      }
+    }).toArray
+    sc.run(tasks)
+    rpc.stop()
+    val splits: Array[ArrayBuffer[(K, Seq[V])]] = (0 until getPartition).map(_ => {
+      new ArrayBuffer[(K, Seq[V])]()
+    }).toArray
+    res.flatten.foreach { case (k, vs) =>
+      val hash = k.hashCode() % getPartition
+      splits(hash) += ((k, vs))
+    }
+    new ReduceRDD(rdd, splits, fn)
+  }
+}
+
+class ReduceRDD[K, V](rdd: RDD[(K, V)], splits: Array[ArrayBuffer[(K, Seq[V])]],
+                      fn: (V, V) => V) extends RDD[(K, V)] {
+  override val sc: SpeakContext = rdd.sc
+
+  override def getPartition: Int = rdd.getPartition
+
+  override def getData(split: Int): Stream[(K, V)] = {
+    splits(split).groupBy(_._1).mapValues(arr => {
+      arr.flatMap(_._2).reduce(fn)
+    }).toStream
   }
 }
 
@@ -140,7 +196,8 @@ object Main {
   def main(args: Array[String]): Unit = {
     val conf = new SpeakConf().setMaster("local[2]").setAppName("Speak")
     val sc = new SpeakContext(conf)
-    sc.paralellize(1 to 10, 3).map(_ * 2).foreach(println)
+    sc.parallelize(1 to 10, 2).map(_ % 3)
+      .map((_, 1)).reduceByKey(_ + _).foreach(println)
     println("Finish")
     System.exit(0) // TODO stop
   }

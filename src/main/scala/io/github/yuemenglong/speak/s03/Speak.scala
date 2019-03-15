@@ -1,17 +1,15 @@
 package io.github.yuemenglong.speak.s03
 
-import java.util
-import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{BlockingDeque, ConcurrentLinkedDeque, LinkedBlockingDeque, TimeUnit}
 
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.JavaConversions._
 
 /**
   * Created by <yuemenglong@126.com> on 2018/12/15.
   */
 
-class SpeakConf extends Serializable {
+class SpeakConf() {
   var executorNum = 0
 
   def setAppName(name: String): SpeakConf = {
@@ -24,104 +22,105 @@ class SpeakConf extends Serializable {
   }
 }
 
-case class OK()
-
-case class Register(id: Int, host: String, port: Int)
-
-case class Execute(task: Task)
-
-case class Finish(e: ExecutorProxy)
-
-case class ShuffleRes[K, V](res: util.HashMap[Int, util.HashMap[K, util.ArrayList[V]]])
-
 class SpeakContext(conf: SpeakConf) extends Serializable {
-  @transient val executors: Array[ExecutorProxy] = (0 until conf.executorNum).map(_ => new ExecutorProxy).toArray
-  @transient val scRpc = new Rpc(6666, {
-    case Register(id, host, port) =>
-      executors(id).host = host
-      executors(id).port = port
-      println(id, host, port)
-      OK()
-  })
-  scRpc.start()
-  // TODO run on yarn
-  (0 until conf.executorNum).map(i => new ExecutorService(i, "localhost", 6666, 6667 + i))
+  @transient val executors: BlockingDeque[ExecutorProxy] = new LinkedBlockingDeque[ExecutorProxy]()
+  (0 until conf.executorNum).map(i => new ExecutorProxy("localhost", 6000 + i)).toArray
+    .foreach(executors.put)
+
+  // yarn start java -cp xx.jar com.xx.ExecutorService i+6000
+  (0 until conf.executorNum).foreach(i => new ExecutorService(i + 6000))
   //  executors.foreach(_.start())
 
   def parallelize[T](seq: Seq[T], partition: Int): RDD[T] = {
     new ParalellizeRDD[T](this, seq, partition)
   }
 
-  def run(tasks: Array[_ <: Task]): Unit = {
-    val counter = new AtomicLong(tasks.length)
-    val ab = new ArrayBuffer() ++ executors
-    val port = Util.testRandPort()
-    val rpc = new Rpc(port, {
-      case Finish(e) =>
-        ab += e
-        ab.synchronized(ab.notify())
-        if (counter.decrementAndGet() == 0) {
+  def run(tasks: Array[Task]): Unit = {
+    val counter = new AtomicLong()
+    val rpc = new Rpc(9999, {
+      case ("Finish", e: ExecutorProxy) => {
+        executors.put(e)
+        if (counter.incrementAndGet() == tasks.length) {
           counter.synchronized(counter.notify())
         }
-        OK()
-    }).start()
-    tasks.foreach { t =>
-      val e = if (ab.nonEmpty) {
-        ab.remove(0)
-      } else {
-        ab.synchronized(ab.wait())
-        ab.remove(0)
+        ""
       }
+    })
+    rpc.start()
+    tasks.foreach(t => {
+      val e = executors.poll(100000, TimeUnit.SECONDS)
       e.execute(new Task {
-        val task: Task = t
-        val executor: ExecutorProxy = e
-
         override def execute(): Unit = {
-          task.execute()
-          Rpc.call("localhost", port, Finish(executor))
+          t.execute()
+          Rpc.call("localhost", 9999, ("Finish", e))
         }
       })
-    }
+    })
     counter.synchronized(counter.wait())
     rpc.stop()
-  }
-
-  def sendMaster(req: Object): Object = {
-    Rpc.call("localhost", 6666, req)
   }
 }
 
 object RDD {
-  implicit def toPair[K, V](rdd: RDD[(K, V)]): PairFn[K, V] = {
-    new PairFn(rdd)
+  implicit def toPair[K, V](rdd: RDD[(K, V)]): PairRDD[K, V] = new PairRDD(rdd)
+}
+
+class PairRDD[K, V](rdd: RDD[(K, V)]) extends RDD[(K, V)] {
+  override val sc: SpeakContext = rdd.sc
+
+  override def getPartition: Int = rdd.getPartition
+
+  override def getData(split: Int): Stream[(K, V)] = rdd.getData(split)
+
+  def reduceByKey(fn: (V, V) => V): RDD[(K, V)] = {
+    // 1. 相同k的聚合在一起
+    val res = new ArrayBuffer[Array[(K, Seq[V])]]
+    val rpc = new Rpc(8888, {
+      case ("Result", item: Array[(K, Seq[V])]) =>
+        res += item
+        ""
+    })
+    rpc.start()
+    val tasks = (0 until getPartition).map(split => {
+      new Task {
+        override def execute(): Unit = {
+          val res = rdd.getData(split).groupBy(_._1).mapValues(_.map(_._2)).toArray
+          Rpc.call("localhost", 8888, ("Result", res))
+        }
+      }
+    }).toArray
+    sc.run(tasks)
+    rpc.stop()
+    val splits: Array[ArrayBuffer[(K, Seq[V])]] = (0 until getPartition).map(_ => {
+      new ArrayBuffer[(K, Seq[V])]()
+    }).toArray
+    res.flatten.foreach { case (k, vs) =>
+      val hash = k.hashCode() % getPartition
+      splits(hash) += ((k, vs))
+    }
+    new ReduceRDD(rdd, splits, fn)
   }
 }
 
-class PairFn[K, V](rdd: RDD[(K, V)]) {
-  def reduceByKey[R](fn: (V, V) => V): RDD[(K, V)] = {
-    new ShuffleRDD(rdd).map { case (k, seq) =>
-      (k, seq.reduce(fn))
-    }
+class ReduceRDD[K, V](rdd: RDD[(K, V)], splits: Array[ArrayBuffer[(K, Seq[V])]],
+                      fn: (V, V) => V) extends RDD[(K, V)] {
+  override val sc: SpeakContext = rdd.sc
+
+  override def getPartition: Int = rdd.getPartition
+
+  override def getData(split: Int): Stream[(K, V)] = {
+    splits(split).groupBy(_._1).mapValues(arr => {
+      arr.flatMap(_._2).reduce(fn)
+    }).toStream
   }
 }
 
 trait RDD[T] extends Serializable {
   val sc: SpeakContext
 
-  def map[R](fn: T => R): RDD[R] = new MappedRDD(this, fn)
-
-  def getDeps: Array[RDD[_]]
+  def map[R](fn: T => R): RDD[R] = new Mapped(this, fn)
 
   def foreach(fn: T => Unit): Unit = {
-    def doReady(rdd: RDD[_]): Unit = {
-      rdd.getDeps.foreach(doReady)
-      if (!rdd.isReady && rdd.isInstanceOf[ShuffleRDD[_, _]]) {
-        rdd.asInstanceOf[ShuffleRDD[_, _]].runShuffleTask()
-      }
-    }
-
-    doReady(this)
-
     val tasks = (0 until getPartition).map(i => new Task {
       override def execute(): Unit = {
         getData(i).foreach(fn)
@@ -133,122 +132,45 @@ trait RDD[T] extends Serializable {
   def getPartition: Int
 
   def getData(split: Int): Stream[T]
-
-  def isReady: Boolean
-}
-
-class ShuffleRDD[K, V](dep: RDD[(K, V)]) extends RDD[(K, Seq[V])] {
-  val blocks: util.ArrayList[util.HashMap[Int, util.HashMap[K, util.ArrayList[V]]]] =
-    new util.ArrayList[util.HashMap[Int, util.HashMap[K, util.ArrayList[V]]]]()
-  var ready: Boolean = false
-  override val sc: SpeakContext = dep.sc
-
-  override def getPartition: Int = dep.getPartition
-
-  override def getDeps: Array[RDD[_]] = Array(dep)
-
-  override def getData(split: Int): Stream[(K, Seq[V])] = {
-    val merged = new util.HashMap[K, util.ArrayList[V]]
-    blocks.map(_.get(split)).foreach(map => {
-      map.foreach { case (k, arr) =>
-        merged.putIfAbsent(k, new util.ArrayList[V]())
-        merged.get(k).addAll(arr)
-      }
-    })
-    merged.toMap.mapValues(_.toSeq).toStream
-  }
-
-  def runShuffleTask(): Unit = {
-    val port = Util.testRandPort()
-    val rpc = new Rpc(port, {
-      case ShuffleRes(map) =>
-        println("AddBlock")
-        blocks.add(map.asInstanceOf[util.HashMap[Int, util.HashMap[K, util.ArrayList[V]]]])
-        OK()
-    }).start()
-
-    val tasks = (0 until getPartition).map(i => new Task {
-      val rdd: RDD[(K, V)] = dep
-      val split: Int = i
-
-      override def execute(): Unit = {
-        val blocks = new util.HashMap[Int, util.HashMap[K, util.ArrayList[V]]]
-        rdd.getData(split).foreach { case (k, v) =>
-          val idx = k.hashCode() % getPartition
-          blocks.putIfAbsent(idx, new util.HashMap[K, util.ArrayList[V]]())
-          blocks.get(idx).putIfAbsent(k, new util.ArrayList[V]())
-          blocks.get(idx).get(k).add(v)
-        }
-        Rpc.call("localhost", port, ShuffleRes(blocks))
-      }
-    }).toArray
-    sc.run(tasks)
-    rpc.stop()
-    ready = true
-  }
-
-  override def isReady: Boolean = ready
 }
 
 class ParalellizeRDD[T](val sc: SpeakContext, seq: Seq[T], part: Int) extends RDD[T] {
   override def getPartition: Int = part
 
-  def splitSize: Int = Math.ceil(seq.length * 1.0 / getPartition).toInt
-
   override def getData(split: Int): Stream[T] = {
-    val start = splitSize * split
-    val end = Math.min(splitSize * (split + 1), seq.length)
-    (start until end).toStream.map(seq(_))
+    val size = Math.ceil(seq.length * 1.0 / part).toInt
+    val arr = seq.grouped(size).drop(split)
+    arr.next().toStream
   }
-
-  override def getDeps: Array[RDD[_]] = Array()
-
-  override def isReady: Boolean = true
 }
 
-class MappedRDD[U, T](dep: RDD[U], fn: U => T) extends RDD[T] {
-  override def getPartition: Int = dep.getPartition
+class Mapped[U, T](parent: RDD[U], fn: U => T) extends RDD[T] {
+  override def getPartition: Int = parent.getPartition
 
-  override def getData(split: Int): Stream[T] = dep.getData(split).map(fn)
+  override def getData(split: Int): Stream[T] = parent.getData(split).map(fn)
 
-  override val sc: SpeakContext = dep.sc
-
-  override def getDeps: Array[RDD[_]] = Array(dep)
-
-  override def isReady: Boolean = dep.isReady
+  override val sc: SpeakContext = parent.sc
 }
 
 trait Task extends Serializable {
   def execute()
 }
 
-class ExecutorProxy extends Serializable {
-  var host = ""
-  var port = 0
-
-  def send(req: Object): Object = {
-    Rpc.call(host, port, req)
-  }
-
+class ExecutorProxy(host: String, port: Int) extends Serializable {
   def execute(task: Task): Unit = {
-    send(Execute(task))
+    Rpc.call(host, port, ("Execute", task))
   }
 }
 
-class ExecutorService(id: Int, mhost: String, mport: Int, port: Int) {
+class ExecutorService(port: Int) {
   val executor = new Executor
   executor.start()
   val rpc = new Rpc(port, {
-    case Execute(task) =>
-      executor.execute(task)
-      OK
+    case ("Execute", t: Task) =>
+      executor.execute(t)
+      ""
   })
   rpc.start()
-  sendMaster(Register(id, "localhost", port))
-
-  def sendMaster(req: Object): Object = {
-    Rpc.call(mhost, mport, req)
-  }
 }
 
 class Executor extends Thread {
@@ -274,6 +196,9 @@ object Main {
   def main(args: Array[String]): Unit = {
     val conf = new SpeakConf().setMaster("local[2]").setAppName("Speak")
     val sc = new SpeakContext(conf)
-    sc.parallelize(1 to 20, 3).map(i => (i % 3, i)).reduceByKey(_ + _).foreach(println)
+    sc.parallelize(1 to 10, 2).map(_ % 3)
+      .map((_, 1)).reduceByKey(_ + _).foreach(println)
+    println("Finish")
+    System.exit(0) // TODO stop
   }
 }
