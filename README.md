@@ -17,4 +17,4 @@ sc.parallelize(1 to 10, 2).map(_ * 2).foreach(println)
 
 ## 0x02 单机版本变为分布式版本
 ## 0x03 加入shuffle和reduce
-![image](http://github.com/yuemenglong/spark-speak/pic/shuffle.png)
+![image](http://github.com/yuemenglong/spark-speak/raw/master/pic/shuffle.png)
