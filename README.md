@@ -16,5 +16,7 @@ sc.parallelize(1 to 10, 2).map(_ * 2).foreach(println)
 ```
 
 ## 0x02 单机版本变为分布式版本
+通过将本地调用转为rpc调用实现，为了实现简单，executor线程与driver线程依然在一个进程中，但是所有的调用都是通过网络通信实现的，也就是随时可以将executor独立出去成为进程
+
 ## 0x03 加入shuffle和reduce
 ![image](https://github.com/yuemenglong/spark-speak/blob/master/pic/shuffle.png)
