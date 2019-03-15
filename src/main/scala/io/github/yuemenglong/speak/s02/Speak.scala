@@ -1,7 +1,7 @@
 package io.github.yuemenglong.speak.s02
 
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.{BlockingDeque, ConcurrentLinkedDeque, LinkedBlockingDeque, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 
 /**
   * Created by <yuemenglong@126.com> on 2018/12/15.

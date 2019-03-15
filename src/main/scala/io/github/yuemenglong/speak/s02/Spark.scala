@@ -8,7 +8,7 @@ import org.apache.spark.{SparkConf, SparkContext}
 object Spark {
   def main(args: Array[String]): Unit = {
     val conf = new SparkConf().setAppName("Speak").setMaster("local[2]")
-    var sc = new SparkContext(conf)
+    val sc = new SparkContext(conf)
     sc.parallelize(1 to 10, 2).map(_ * 2).foreach(println)
   }
 }
